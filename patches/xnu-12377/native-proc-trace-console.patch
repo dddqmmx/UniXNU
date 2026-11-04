@@ -1,0 +1,398 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1898,6 +1898,24 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region
+     0, 0, rsr_version_sysctl, "I", "");
+ #endif /* XNU_TARGET_OS_OSX */
+ 
++#if defined(XNU_PROC_TRACE_CONSOLE) && XNU_PROC_TRACE_CONSOLE
++/*
++ * Print every exec and spawn with its result on the console. A port whose
++ * userland has no log daemon yet can follow what launchd starts.
++ */
++static void
++exec_trace_console(proc_t p, struct image_params *imgp, int error)
++{
++	const char *path = "?";
++
++	if (imgp != NULL && imgp->ip_strings != NULL) {
++		path = imgp->ip_strings + strlen(EXECUTABLE_KEY);
++	}
++	printf("proc-trace: exec pid %d ppid %d %s error %d\n",
++	    proc_getpid(p), proc_ppid(p), path, error);
++}
++#endif
++
+ /*
+  * exec_mach_imgact
+  *
+@@ -5563,6 +5581,9 @@ bad:
+ 	if (!error && ((p->p_lflag & P_LTERM_DECRYPTFAIL) == 0)) {
+ 		proc_knote(p, NOTE_EXEC);
+ 	}
++#if defined(XNU_PROC_TRACE_CONSOLE) && XNU_PROC_TRACE_CONSOLE
++	exec_trace_console(p, imgp, error);
++#endif
+ 
+ 	if (imgp != NULL) {
+ 		uthread_set_exec_data(current_uthread(), NULL);
+@@ -6204,6 +6225,9 @@ __mac_execve(proc_t p, struct __mac_exec
+ 	if (exec_done && ((p->p_lflag & P_LTERM_DECRYPTFAIL) == 0)) {
+ 		proc_knote(p, NOTE_EXEC);
+ 	}
++#if defined(XNU_PROC_TRACE_CONSOLE) && XNU_PROC_TRACE_CONSOLE
++	exec_trace_console(p, imgp, error);
++#endif
+ 
+ 	if (imgp->ip_vp != NULLVP) {
+ 		vnode_put(imgp->ip_vp);
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1637,6 +1637,12 @@ exit1_internal(proc_t p, int rv, int *re
+ /*
+  * NOTE: exit_with_reason drops a reference on the passed exit_reason
+  */
++#if defined(XNU_PROC_TRACE_CONSOLE) && XNU_PROC_TRACE_CONSOLE && defined(__arm64__)
++extern void proc_trace_abort_reason(char *out, size_t capacity);
++extern void proc_trace_abort_frames(void);
++extern void proc_trace_watchdog_frames(void);
++#endif
++
+ int
+ exit_with_reason(proc_t p, int rv, int *retval, boolean_t thread_can_terminate, boolean_t perf_notify,
+     int jetsam_flags, struct os_reason *exit_reason)
+@@ -1647,6 +1653,34 @@ exit_with_reason(proc_t p, int rv, int *
+ 	int error = 0;
+ 	bool proc_exiting = false;
+ 
++#if defined(XNU_PROC_TRACE_CONSOLE) && XNU_PROC_TRACE_CONSOLE
++	/* The wait status carries the exit code or the terminating signal; abort_with_reason adds a description. */
++	const char *exit_desc = exit_reason_get_string_desc(exit_reason);
++	printf("proc-trace: exit pid %d %s status 0x%x reason %u/0x%llx%s%s\n", proc_getpid(p), p->p_comm, rv,
++	    exit_reason != OS_REASON_NULL ? exit_reason->osr_namespace : 0,
++	    exit_reason != OS_REASON_NULL ? exit_reason->osr_code : 0ULL,
++	    exit_desc != NULL ? " " : "", exit_desc != NULL ? exit_desc : "");
++#if defined(__arm64__)
++	if (p == current_proc() && (rv & 0x7f) == SIGABRT) {
++		char abort_text[512];
++
++		proc_trace_abort_frames();
++		proc_trace_abort_reason(abort_text, sizeof(abort_text));
++		if (abort_text[0] != 0) {
++			printf("proc-trace: abort pid %d %s: %s\n", proc_getpid(p), p->p_comm, abort_text);
++		}
++	}
++	/*
++	 * A watchdog kill (FrontBoard's 0x8badf00d in namespace OS_REASON_SPRINGBOARD: a main thread that held a scene update past its allowance) is a
++	 * SIGKILL the killed process takes itself: its threads still stand where they waited, so they are printed too.
++	 */
++	if (p == current_proc() && (rv & 0x7f) == SIGKILL && exit_reason != OS_REASON_NULL &&
++	    exit_reason->osr_namespace == OS_REASON_SPRINGBOARD) {
++		proc_trace_watchdog_frames();
++	}
++#endif
++#endif
++
+ #if DEVELOPMENT || DEBUG
+ 	/*
+ 	 * Debug boot-arg: panic here if matching process is exiting with non-zero code.
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -133,6 +133,282 @@ extern int      proc_selfpid(void);
+ extern char     *proc_name_address(struct proc *p);
+ #endif /* MACH_BSD */
+ 
++#if defined(XNU_PROC_TRACE_CONSOLE) && XNU_PROC_TRACE_CONSOLE && defined(__arm64__)
++#include <arm/thread.h>
++#include <vm/vm_shared_region_internal.h>
++#include <vm/vm_map_internal.h>
++
++/*
++ * Print the user registers, a frame-pointer backtrace and the shared cache
++ * base of a thread that raises a hardware exception. Without a crash
++ * reporter this is the only record of where userland faulted.
++ */
++static void
++exception_trace_console(task_t task, thread_t thread, exception_type_t exception,
++    mach_exception_data_t code, mach_msg_type_number_t codeCnt)
++{
++	struct arm_saved_state *state = get_user_regs(thread);
++	vm_shared_region_t shared_region;
++	mach_vm_offset_t cache = 0;
++	uint64_t frame[2], fp;
++	int pid = proc_pid(get_bsdtask_info(task));
++
++	if (exception < EXC_BAD_ACCESS || exception > EXC_BREAKPOINT || state == NULL || !is_saved_state64(state)) {
++		return;
++	}
++	shared_region = vm_shared_region_get(task);
++	if (shared_region != NULL) {
++		if (vm_shared_region_start_address(shared_region, &cache) != KERN_SUCCESS) {
++			cache = 0;
++		}
++		vm_shared_region_deallocate(shared_region);
++	}
++	printf("proc-trace: exception pid %d %s type %d codes 0x%llx 0x%llx pc 0x%llx lr 0x%llx sp 0x%llx "
++	    "far 0x%llx esr 0x%llx cache 0x%llx\n", pid, proc_name_address(get_bsdtask_info(task)), exception,
++	    (uint64_t)code[0], codeCnt > 1 ? (uint64_t)code[1] : 0, (uint64_t)get_saved_state_pc(state),
++	    (uint64_t)get_saved_state_lr(state), (uint64_t)get_saved_state_sp(state), (uint64_t)get_saved_state_far(state),
++	    get_saved_state_esr(state), (uint64_t)cache);
++	for (unsigned reg = 0; reg < 29; reg += 4) {
++		printf("proc-trace:  x%u 0x%llx 0x%llx 0x%llx 0x%llx\n", reg, (uint64_t)get_saved_state_reg(state, reg),
++		    reg + 1 < 29 ? (uint64_t)get_saved_state_reg(state, reg + 1) : 0,
++		    reg + 2 < 29 ? (uint64_t)get_saved_state_reg(state, reg + 2) : 0,
++		    reg + 3 < 29 ? (uint64_t)get_saved_state_reg(state, reg + 3) : 0);
++	}
++	fp = (uint64_t)get_saved_state_fp(state);
++	for (int depth = 0; depth < 16 && fp != 0 && (fp & 0xf) == 0; depth++) {
++		if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
++			break;
++		}
++		printf("proc-trace:  frame %d 0x%llx\n", depth, (unsigned long long)frame[1]);
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++}
++
++/*
++ * SIGABRT carries no text: the reason sits in the malloc heap of the aborting
++ * process ("*** Terminating app due to uncaught exception", "Assertion failed",
++ * "Fatal error"). Scan the writable malloc regions of the calling task for the
++ * best printable run, as the sheng fault probe does (package/BootFaultProbe.c).
++ */
++#define PROC_TRACE_REASON_CHUNK 65536
++static char proc_trace_reason_chunk[PROC_TRACE_REASON_CHUNK];
++static int proc_trace_reason_busy;
++
++static int
++proc_trace_reason_rank(const char *run, size_t length)
++{
++	/* The plugin's exception record (ExceptionDiag.h: name, reason and the throw's frames) outranks libc++abi's bare "uncaught exception". */
++	if (strnstr(run, "SHENGTHROW ", length) != NULL) {
++		return 4;
++	}
++	if (strnstr(run, "uncaught exception", length) != NULL || strnstr(run, "Assertion fail", length) != NULL ||
++	    strnstr(run, "Fatal error", length) != NULL || strnstr(run, "BUG IN", length) != NULL) {
++		return 3;
++	}
++	/* The Metal frontend's latest refusal: what an abort_with_reason caller ("Metal failed to build compute pipeline") was refused. */
++	if (strnstr(run, "SHENGPROBLEM ", length) != NULL) {
++		return 2;
++	}
++	return strnstr(run, "reason: ", length) != NULL ? 1 : 0;
++}
++
++void proc_trace_abort_reason(char *out, size_t capacity);
++void proc_trace_abort_frames(void);
++
++/*
++ * The other threads of the aborting task, from their last entry into the
++ * kernel: a thread blocked in a call shows where it waits, so an abort that
++ * is a race with another thread names that thread's code. The rows are taken
++ * under the task lock and the frames read after it is dropped.
++ */
++#define PROC_TRACE_SIBLINGS 64
++/* Frames per sibling: 10 for an abort; a watchdog kill walks 40, since the waiting call sits under the runtime that waits. */
++static int proc_trace_sibling_depth = 10;
++static struct {
++	uint64_t tid, pc, lr, fp;
++	int state;
++	char name[32];
++} proc_trace_siblings[PROC_TRACE_SIBLINGS];
++
++static void
++proc_trace_abort_siblings(task_t task)
++{
++	unsigned count = 0, total = 0;
++	thread_t thread;
++
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		struct arm_saved_state *state;
++		char name[64];	/* MAXTHREADNAMESIZE */
++
++		total++;
++		if (thread == current_thread() || count >= PROC_TRACE_SIBLINGS) {
++			continue;
++		}
++		state = get_user_regs(thread);
++		if (state == NULL || !is_saved_state64(state)) {
++			continue;
++		}
++		proc_trace_siblings[count].tid = thread_tid(thread);
++		proc_trace_siblings[count].pc = get_saved_state_pc(state);
++		proc_trace_siblings[count].lr = get_saved_state_lr(state);
++		proc_trace_siblings[count].fp = get_saved_state_fp(state);
++		proc_trace_siblings[count].state = thread->state;
++		name[0] = 0;
++		thread_get_thread_name(thread, name);
++		strlcpy(proc_trace_siblings[count].name, name, sizeof(proc_trace_siblings[count].name));
++		count++;
++	}
++	task_unlock(task);
++	printf("proc-trace: abort threads %u (aborting tid 0x%llx)\n", total, thread_tid(current_thread()));
++	for (unsigned i = 0; i < count; i++) {
++		char line[240];
++		uint64_t frame[2], fp = proc_trace_siblings[i].fp;
++		int used = snprintf(line, sizeof(line), "proc-trace:  thread 0x%llx st %x %s pc 0x%llx lr 0x%llx",
++		    proc_trace_siblings[i].tid, proc_trace_siblings[i].state,
++		    proc_trace_siblings[i].name[0] ? proc_trace_siblings[i].name : "-",
++		    proc_trace_siblings[i].pc, proc_trace_siblings[i].lr);
++
++		for (int depth = 0; depth < proc_trace_sibling_depth && fp != 0 && (fp & 0xf) == 0 && used > 0; depth++) {
++			if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
++				break;
++			}
++			if (used >= (int)sizeof(line) - 20) {
++				printf("%s\n", line);
++				used = snprintf(line, sizeof(line), "proc-trace:   ...");
++			}
++			used += snprintf(line + used, sizeof(line) - used, " 0x%llx", (unsigned long long)frame[1]);
++			if (frame[0] <= fp) {
++				break;
++			}
++			fp = frame[0];
++		}
++		printf("%s\n", line);
++	}
++}
++
++/*
++ * abort() raises SIGABRT on the calling thread, which takes the signal and
++ * exits: its user state is the abort site. Print it like an exception, then
++ * the task's other threads.
++ */
++void
++proc_trace_abort_frames(void)
++{
++	task_t task = current_task();
++	struct arm_saved_state *state = get_user_regs(current_thread());
++	vm_shared_region_t shared_region;
++	mach_vm_offset_t cache = 0;
++	uint64_t frame[2], fp;
++
++	if (state == NULL || !is_saved_state64(state)) {
++		return;
++	}
++	shared_region = vm_shared_region_get(task);
++	if (shared_region != NULL) {
++		if (vm_shared_region_start_address(shared_region, &cache) != KERN_SUCCESS) {
++			cache = 0;
++		}
++		vm_shared_region_deallocate(shared_region);
++	}
++	printf("proc-trace: abort pid %d %s pc 0x%llx lr 0x%llx sp 0x%llx cache 0x%llx\n",
++	    proc_pid(get_bsdtask_info(task)), proc_name_address(get_bsdtask_info(task)),
++	    (uint64_t)get_saved_state_pc(state), (uint64_t)get_saved_state_lr(state),
++	    (uint64_t)get_saved_state_sp(state), (uint64_t)cache);
++	fp = (uint64_t)get_saved_state_fp(state);
++	for (int depth = 0; depth < 48 && fp != 0 && (fp & 0xf) == 0; depth++) {
++		if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
++			break;
++		}
++		printf("proc-trace:  frame %d 0x%llx\n", depth, (unsigned long long)frame[1]);
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	proc_trace_abort_siblings(task);
++}
++
++void proc_trace_watchdog_frames(void);
++
++/* The killed thread's own frames, then every other thread's, as for an abort. */
++void
++proc_trace_watchdog_frames(void)
++{
++	proc_trace_sibling_depth = 40;
++	proc_trace_abort_frames();
++	proc_trace_sibling_depth = 10;
++}
++
++void
++proc_trace_abort_reason(char *out, size_t capacity)
++{
++	vm_map_t map = current_map();
++	vm_map_offset_t address = 0;
++	uint64_t scanned = 0;
++	int best = 0;
++
++	if (capacity == 0) {
++		return;
++	}
++	out[0] = 0;
++	if (__atomic_exchange_n(&proc_trace_reason_busy, 1, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	while (scanned < (160ULL << 20) && best < 4) {
++		/* The _ut types are wrapped structs or plain integers by configuration; both hold one 64-bit word. */
++		vm_map_offset_ut address_u;
++		vm_map_size_ut size_u;
++		vm_map_offset_t base;
++		vm_map_size_t size = 0;
++		vm_region_submap_info_data_64_t info;
++		mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_V2_COUNT_64;
++		natural_t depth = 0;
++
++		_Static_assert(sizeof(address_u) == sizeof(address) && sizeof(size_u) == sizeof(size), "wrapped VM words");
++		memcpy(&address_u, &address, sizeof(address));
++		memcpy(&size_u, &size, sizeof(size));
++		if (vm_map_region_recurse_64(map, &address_u, &size_u, &depth, &info, &count) != KERN_SUCCESS) {
++			break;
++		}
++		memcpy(&base, &address_u, sizeof(base));
++		memcpy(&size, &size_u, sizeof(size));
++		address = base + size;
++		if (info.is_submap || (info.protection & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE) ||
++		    info.user_tag < VM_MEMORY_MALLOC || info.user_tag > VM_MEMORY_MALLOC_NANO) {
++			continue;
++		}
++		for (vm_map_size_t offset = 0; offset < size && best < 4; offset += PROC_TRACE_REASON_CHUNK) {
++			size_t length = size - offset < PROC_TRACE_REASON_CHUNK ? (size_t)(size - offset) : PROC_TRACE_REASON_CHUNK;
++			size_t start = 0;
++
++			if (copyin((user_addr_t)(base + offset), proc_trace_reason_chunk, length) != 0) {
++				continue;
++			}
++			scanned += length;
++			for (size_t i = 0; i <= length && best < 4; i++) {
++				if (i < length && proc_trace_reason_chunk[i] >= 0x20 && proc_trace_reason_chunk[i] < 0x7f) {
++					continue;
++				}
++				size_t run = i - start;
++				int rank = run >= 24 ? proc_trace_reason_rank(proc_trace_reason_chunk + start, run) : 0;
++				if (rank > best) {
++					size_t copied = run < capacity - 1 ? run : capacity - 1;
++					memcpy(out, proc_trace_reason_chunk + start, copied);
++					out[copied] = 0;
++					best = rank;
++				}
++				start = i + 1;
++			}
++		}
++	}
++	__atomic_store_n(&proc_trace_reason_busy, 0, __ATOMIC_RELEASE);
++}
++#endif
++
+ #if (DEVELOPMENT || DEBUG)
+ TUNABLE_WRITEABLE(unsigned int, exception_log_max_pid, "exception_log_max_pid", 0);
+ #endif /* (DEVELOPMENT || DEBUG) */
+@@ -932,6 +1200,15 @@ exception_triage(
+ 		}
+ 	}
+ 
++#if defined(XNU_PROC_TRACE_CONSOLE) && XNU_PROC_TRACE_CONSOLE && defined(__arm64__)
++#ifdef EXC_PTRAUTH_BIT
++	exception_trace_console(task, thread, exception & ~(EXC_PTRAUTH_BIT | EXC_MAY_BE_UNRECOVERABLE_BIT),
++	    code, codeCnt);
++#else
++	exception_trace_console(task, thread, exception & ~EXC_MAY_BE_UNRECOVERABLE_BIT, code, codeCnt);
++#endif
++#endif
++
+ #if DEVELOPMENT || DEBUG
+ #ifdef MACH_BSD
+ 	if (proc_pid(get_bsdtask_info(task)) <= exception_log_max_pid) {

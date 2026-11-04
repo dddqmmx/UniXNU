@@ -1,0 +1,2 @@
+# The xnu-12377 series is declared by the arch layer (profiles/arch/arm64-ios26/patches/xnu/series).
+# An OS-level patch of this release goes here.

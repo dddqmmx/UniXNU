@@ -1,0 +1,17 @@
+[arch]
+# The iOS/iPadOS 26 kernel is built from xnu-12377 as ordinary ARM64: the boards that use this
+# layer have no pointer authentication, so the target kernelcache's arm64e kexts are never linked
+# (there is no prelink) and the userland is lowered to arm64 offline.
+name = "arm64-ios26"
+page_size = 4096
+
+[components]
+include = ["ArmDTPlatform", "ArmCpu"]
+
+[kernel]
+config_fragments = ["arch:configs/common.config"]
+# Only the arch and OS series: the device series of the arm64 (iOS 17) layer patches xnu-10063 and
+# does not apply to xnu-12377. A device adds its own 12377 patches deliberately.
+patch_series = ["arch:patches/xnu/series", "os:patches/xnu/series"]
+# build-xnu-12377.sh builds and links its own archives; the shared archive recipes are for xnu-10063.
+archives = []

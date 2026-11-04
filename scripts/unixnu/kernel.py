@@ -2,6 +2,7 @@
 import os
 import platform
 import shlex
+import shutil
 from pathlib import Path
 
 from . import components, ipsw, patches
@@ -30,6 +31,9 @@ def version_env(modules, ctx=None):
             env[f'UNIXNU_{prefix}_TAG'] = entry['ref']
         if entry.get('commit'):
             env[f'UNIXNU_{prefix}_COMMIT'] = entry['commit']
+    profile = ctx.board.get('os', {}) if getattr(ctx, 'schema_version', 1) == 2 else {}
+    if profile.get('ios_version'):
+        env['XNU_IOS_MIN'] = str(profile['ios_version'])
     xnu = (modules.get(('refer', 'xnu')) or None) and modules[('refer', 'xnu')].source or {}
     for key, variable in (('darwin', 'UNIXNU_XNU_DARWIN'), ('version', 'UNIXNU_XNU_VERSION'),
                           ('driverkit_tag', 'UNIXNU_DRIVERKIT_TAG'), ('trustcache_tag', 'UNIXNU_TRUSTCACHE_TAG')):
@@ -70,14 +74,23 @@ def linux_env(ctx):
         if not path.exists():
             raise Error(f'{path} missing; run "sudo scripts/linux/setup-toolchain.py {toolchain}"')
     fakeroot = ctx.tree / '.cache/fakeroot'
-    return {'PATH': os.pathsep.join([str(clt / 'bin'), str(toolchain / 'bin'), os.environ.get('PATH', '')]),
+    # The deployment target of the selected OS profile: an iOS 26 profile builds xnu-12377 with
+    # -miphoneos-version-min=26.0, the iPadOS 17 profiles stay on 17.0.
+    profile = ctx.board.get('os', {}) if getattr(ctx, 'schema_version', 1) == 2 else {}
+    ios_min = str(profile.get('ios_version') or '17.0')
+    sdk_build = (ctx.board.get('ipsw') or {}).get('build')
+    environment = {'PATH': os.pathsep.join([str(clt / 'bin'), str(toolchain / 'bin'), os.environ.get('PATH', '')]),
             'LC_ALL': 'C', 'CLT_PREFIX': str(clt), 'XCTOOLCHAIN_PREFIX': str(xctoolchain),
             'XNU_TOOLCHAIN_BIN': f'{clt / "bin"} {xctoolchain / "bin"}',
-            'UNIXNU_SDKROOT': str(fakeroot), 'UNIXNU_SDK_VERSION': '17.0',
+            'UNIXNU_SDKROOT': str(fakeroot), 'UNIXNU_SDK_VERSION': ios_min,
             'UNIXNU_PLATFORM_PATH': str(fakeroot / 'Platforms/iPhoneOS.platform'),
-            'CROSS_CLANG': str(toolchain / 'llvm/bin/clang'), 'DARWIN_TRIPLE': 'arm64-apple-ios17.0',
+            'CROSS_CLANG': str(toolchain / 'llvm/bin/clang'), 'DARWIN_TRIPLE': f'arm64-apple-ios{ios_min}',
+            'XNU_IOS_MIN': ios_min,
             'CROSS_EXTRA_FLAGS': '-mllvm -disable-atexit-based-global-dtor-lowering',
             'CCC_OVERRIDE_OPTIONS': '# +-Wno-missing-designated-field-initializers +-Wno-unused-but-set-global'}
+    if sdk_build:
+        environment['UNIXNU_SDK_BUILD'] = str(sdk_build)
+    return environment
 
 
 def archive_plan(ctx):
@@ -147,7 +160,10 @@ def build_archives(ctx, env):
 
 def build(ctx, modules):
     log('kernel: XNU')
-    script = ctx.tree / 'scripts/build-xnu-4k-baseline.sh'
+    # CONFIG_XNU_BUILD_SCRIPT picks the kernel build of the configuration: build-xnu-12377.sh for xnu-12377.
+    name = ctx.need_config().get('XNU_BUILD_SCRIPT') or 'build-xnu-4k-baseline.sh'
+    script = ctx.tree / 'scripts' / name
+    baseline = name == 'build-xnu-4k-baseline.sh'
     if not script.is_file():
         raise Error(f'{script} missing')
     env = dict(os.environ)
@@ -168,7 +184,7 @@ def build(ctx, modules):
         env['UNIXNU_GENERATED_DIR'] = str(generated)
     env['JOBS'] = str(ctx.jobs)
     record = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/osfmk/DEVELOPMENT/startup.o.json'
-    if not record.is_file():
+    if baseline and not record.is_file():
         # The archive builders and the boot progress layer read compile records of the XNU build, which only an earlier
         # pass leaves behind. A first build from scratch therefore runs one pass without them; XNU_BOOTSTRAP makes it
         # skip the archive checks and link without the archives, so it stops at the link and only the records are
@@ -180,13 +196,25 @@ def build(ctx, modules):
         except Error:
             if not record.is_file():
                 raise
+    # The public IOStorageFamily headers feed the xnu-10063 storage archives; the xnu-12377 build
+    # (archives = [] or its own recipes) does not consume build/storage-abi.
     storage = ctx.tree / 'build/storage-abi/include/IOKit/storage'
-    if (ctx.tree / 'refer/IOStorageFamily').is_dir() and not storage.is_dir():
+    if (baseline or ctx.need_config().get('XNU_STORAGE_HEADERS')) and \
+            (ctx.tree / 'refer/IOStorageFamily').is_dir() and not storage.is_dir():
         log('kernel: prepare storage headers')
         run(['python3', ctx.tree / 'scripts/prepare-storage-headers.py'], cwd=ctx.tree, env=env,
             log_file=ctx.logs / 'storage-headers.log')
     build_archives(ctx, env)
     run(['bash', script], cwd=ctx.tree, env=env, log_file=ctx.logs / 'kernel.log')
+    # [kernel] outputs: files of the build tree kept in out/<device>/kernel next to the prelinked kernel.
+    for output in ctx.board.get('kernel', {}).get('outputs', []):
+        source = ctx.tree / output
+        if not source.is_file():
+            raise Error(f'[kernel] outputs: {source} was not built')
+        target = ctx.work / 'kernel' / source.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        log(f'kernel: {target} sha256 {sha256_file(target)}')
 
 
 def prelink(ctx):

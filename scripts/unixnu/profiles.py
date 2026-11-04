@@ -25,8 +25,18 @@ def load(ctx, allow_fetch=False):
     if Path(os_name).name != os_name or os_name in ('.', '..'):
         raise Error('[board] os_profile must be a profile directory name')
     ctx.soc = feeds.resolve_soc(ctx, soc_name, allow_fetch)
-    ctx.profile_roots = {'arch': ctx.root / 'profiles/arch/arm64', 'soc': ctx.soc.path,
-                         'os': ctx.root / 'profiles/os' / os_name, 'device': ctx.device}
+    os_root = ctx.root / 'profiles/os' / os_name
+    if not (os_root / 'profile.toml').is_file():
+        raise Error(f'no such OS profile: {os_name}')
+    # [os] arch names the arch layer (arm64, arm64e, arm64-ios26, ...); the iOS 17 profiles that
+    # predate the key keep the arm64 layer.
+    arch_name = (load_toml(os_root / 'profile.toml').get('os', {}) or {}).get('arch') or 'arm64'
+    if Path(arch_name).name != arch_name or arch_name in ('.', '..'):
+        raise Error('[os] arch must be a profile directory name')
+    arch_root = ctx.root / 'profiles/arch' / arch_name
+    if not (arch_root / 'profile.toml').is_file():
+        raise Error(f'no such arch profile: {arch_name} (named by {os_name})')
+    ctx.profile_roots = {'arch': arch_root, 'soc': ctx.soc.path, 'os': os_root, 'device': ctx.device}
     ctx.profile_files = [ctx.profile_roots['arch'] / 'profile.toml', ctx.soc.path / 'soc.toml',
                          ctx.profile_roots['os'] / 'profile.toml', ctx.device / 'board.toml']
     result = {}

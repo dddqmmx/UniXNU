@@ -1,0 +1,58 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -419,9 +419,55 @@ IOTaskRegistryCompatibility(task_t task)
+ 	return false;
+ }
+ 
++#if defined(XNU_NATIVE_IOS_CLASS_ALIASES) && XNU_NATIVE_IOS_CLASS_ALIASES
++/*
++ * iOS userland over the macOS KDK kexts: some families publish their root
++ * service under the macOS class name. IOSurface.framework name-matches
++ * IOCoreSurfaceRoot and aborts when it is missing; the macOS kext's class
++ * (and so its name) is IOSurfaceRoot. Rewrite the iOS class or name a task
++ * matches on. Metal's device discovery (_MTLRegisterDevices) class-matches
++ * IOAcceleratorES, which no KDK kext provides: the board's NativeAdreno
++ * service (NativeAdrenoGpuPublished, MetalPluginName on it) answers it.
++ */
++static const char * const gIOSClassAliases[][2] = {
++	{ "IOCoreSurfaceRoot", "IOSurfaceRoot" },
++	{ "IOAcceleratorES", "NativeAdrenoGpuPublished" },
++};
++
++static void
++IOTaskRegistryClassAlias(OSDictionary * matching, const OSSymbol * key)
++{
++	OSString * name = OSDynamicCast(OSString, matching->getObject(key));
++
++	if (name == NULL) {
++		return;
++	}
++	for (const auto & alias : gIOSClassAliases) {
++		if (name->isEqualTo(alias[0])) {
++			const OSSymbol * replacement = OSSymbol::withCString(alias[1]);
++			if (replacement != NULL) {
++				matching->setObject(key, replacement);
++				replacement->release();
++			}
++			return;
++		}
++	}
++}
++
++static void
++IOTaskRegistryClassAliases(OSDictionary * matching)
++{
++	IOTaskRegistryClassAlias(matching, gIOProviderClassKey);
++	IOTaskRegistryClassAlias(matching, gIONameMatchKey);
++}
++#endif
++
+ static void
+ IOTaskRegistryCompatibilityMatching(task_t task, OSDictionary * matching)
+ {
++#if defined(XNU_NATIVE_IOS_CLASS_ALIASES) && XNU_NATIVE_IOS_CLASS_ALIASES
++	IOTaskRegistryClassAliases(matching);
++#endif
+ 	matching->setObject(gIOServiceNotificationUserKey, kOSBooleanTrue);
+ 	if (!IOTaskRegistryCompatibility(task)) {
+ 		return;

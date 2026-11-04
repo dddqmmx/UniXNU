@@ -87,7 +87,13 @@ def build(ctx, kernel=None):
     if not spec:
         raise Error('board.toml has no [payload]')
     args = ctx.args
-    kernel = expand(kernel or getattr(args, 'kernel', None) or ctx.work / 'kernel/kernel.macho')
+    # A board without a prelink step has no kernel.macho: its linked kernel is the [kernel]
+    # outputs artifact that the kernel step copied into the same directory.
+    kernel_spec = ctx.board.get('kernel', {})
+    default_kernel = ctx.work / 'kernel/kernel.macho'
+    if not kernel_spec.get('prelink') and kernel_spec.get('outputs'):
+        default_kernel = ctx.work / 'kernel' / Path(kernel_spec['outputs'][-1]).name
+    kernel = expand(kernel or getattr(args, 'kernel', None) or default_kernel)
     if not kernel.is_file():
         raise Error(f'kernel not found: {kernel}; run "unixnu build kernel" or pass --kernel FILE')
     extra = list(getattr(args, 'kernel_arg', None) or [])

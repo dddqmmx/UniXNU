@@ -10,13 +10,16 @@ Each rewrite checks whether it is still needed, so both modes can run on every b
 """
 from pathlib import Path
 import shutil
+import os
 import subprocess
 import sys
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-XNU = ROOT / '.cache/xnu-work'
-FAKEROOT = ROOT / '.cache/fakeroot'
+# Both belong to the build that calls this: the xnu-10063 baseline keeps the defaults,
+# build-xnu-12377.sh passes its versioned working tree and fakeroot.
+XNU = Path(os.environ.get('UNIXNU_XNU_WORK') or (ROOT / '.cache/xnu-work'))
+FAKEROOT = Path(os.environ.get('UNIXNU_FAKEROOT') or (ROOT / '.cache/fakeroot'))
 # llvm-project at the commit setup-toolchain.py builds clang from, and the Libc that macOS 14.6 ships with
 # xnu-10063.141.1 (distribution-macOS release.json).
 LLVM_COMMIT = '58c46bae21181fb4240cf964461bea738d96d50e'
@@ -120,7 +123,8 @@ def build_cc_kext():
     objects.mkdir(parents=True, exist_ok=True)
     out.parent.mkdir(parents=True, exist_ok=True)
     for name in PROFILE_SOURCES:
-        subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-arch', 'arm64', '-isysroot', FAKEROOT,
+        target = os.environ.get('DARWIN_TRIPLE', 'arm64-apple-ios17.0')
+        subprocess.run(['xcrun', 'clang', '-target', target, '-arch', 'arm64', '-isysroot', FAKEROOT,
                         '-mkernel', '-DKERNEL_USE', '-O3', '-fPIC', '-w',
                         '-I', rt / 'include', '-I', FAKEROOT / 'System/Library/Frameworks/Kernel.framework/Headers',
                         '-idirafter', src / 'Libc/include', '-idirafter', XNU / 'libsyscall/wrappers',
