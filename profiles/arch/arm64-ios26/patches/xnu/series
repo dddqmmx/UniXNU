@@ -29,6 +29,7 @@
 ../../../../../patches/xnu-12377/native-smp-trace.patch
 ../../../../../patches/xnu-12377/native-source-crypto.patch
 ../../../../../patches/xnu-12377/native-storage-personalities.patch
+../../../../../patches/xnu-12377/native-board-storage.patch
 ../../../../../patches/xnu-12377/native-text-fixup.patch
 ../../../../../patches/xnu-12377/native-trust-cache-runtime.patch
 ../../../../../patches/xnu-12377/native-ufs-owner-root.patch

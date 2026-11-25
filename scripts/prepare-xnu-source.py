@@ -60,17 +60,18 @@ if __name__ == '__main__':
         entries.append(entry)
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         restored = [entry for entry in executor.map(restore, entries) if entry]
-        trust_tag = TRUST_TAG
-        trust_cache = CACHE.with_name(f'xnu-trustcache-{TRUST_TAG.removeprefix("xnu-")}.json')
-        if not trust_cache.exists():
-            url = ('https://api.github.com/repos/apple-oss-distributions/xnu/'
-                   f'contents/EXTERNAL_HEADERS/TrustCache?ref={trust_tag}')
-            trust_cache.write_bytes(fetch(url))
-        trust_destination = Path('.cache/xnu-work/EXTERNAL_HEADERS/TrustCache')
-        def restore_trust(entry):
-            return restore(entry, trust_destination, trust_tag)
-        restored.extend(entry for entry in executor.map(
-            restore_trust, json.loads(trust_cache.read_text())) if entry)
+        if not TAG.startswith('xnu-12377'):
+            trust_tag = TRUST_TAG
+            trust_cache = CACHE.with_name(f'xnu-trustcache-{TRUST_TAG.removeprefix("xnu-")}.json')
+            if not trust_cache.exists():
+                url = ('https://api.github.com/repos/apple-oss-distributions/xnu/'
+                       f'contents/EXTERNAL_HEADERS/TrustCache?ref={trust_tag}')
+                trust_cache.write_bytes(fetch(url))
+            trust_destination = Path('.cache/xnu-work/EXTERNAL_HEADERS/TrustCache')
+            def restore_trust(entry):
+                return restore(entry, trust_destination, trust_tag)
+            restored.extend(entry for entry in executor.map(
+                restore_trust, json.loads(trust_cache.read_text())) if entry)
     previous = Path('.cache/sources/xnu-restored-headers.json')
     existing = json.loads(previous.read_text()) if previous.exists() else []
     by_name = {entry['name']: entry for entry in existing + restored}

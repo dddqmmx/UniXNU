@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Build public IOStorageFamily's native kernel path and SM8350 UFS for XNU 12377."""
+"""Build public IOStorageFamily's native kernel path and SM8350 UFS for XNU 12377.
+
+--family-only builds the public IOStorageFamily alone into build/storage-12377/family/ (objects and
+libStorageFamily.a), for a board that links its own block driver (XNU_BOARD_STORAGE); the UFS sources
+and their patch are not touched then.
+"""
+import argparse
 import hashlib
 import json
 import os
@@ -13,6 +19,12 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from xnu_symbols import kernel_names
+from kdk_iokit_abi import enabled, storage_copy, validate_compile_profile
+
+parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+parser.add_argument('--family-only', action='store_true',
+                    help='build IOStorageFamily without the SM8350 UFS driver')
+FAMILY_ONLY = parser.parse_args().family_only
 
 SOURCE = ROOT / 'refer/IOStorageFamily'
 REVISION = '7edb88fbae296fb7c8ce2f64e115e116e566d51c'
@@ -20,28 +32,35 @@ if subprocess.check_output(['git', '-C', SOURCE, 'rev-parse', 'HEAD'], text=True
     raise SystemExit('Expected pinned IOStorageFamily 337.100.1')
 if subprocess.check_output(['git', '-C', SOURCE, 'status', '--porcelain'], text=True):
     raise SystemExit('IOStorageFamily reference must remain immutable')
-OUT = ROOT / 'build/storage-12377'
+OUT = ROOT / 'build/storage-12377' / ('family' if FAMILY_ONLY else '')
 OUT.mkdir(parents=True, exist_ok=True)
 UFS = OUT / 'NativeUfs'
-shutil.copytree(ROOT / 'drivers/NativeUfs', UFS,
-                ignore=shutil.ignore_patterns('.git', 'build'), dirs_exist_ok=True)
-# The assembled tree is nested inside the checkout. git apply can otherwise
-# silently skip paths outside that repository-relative cwd prefix. Apply from
-# a fresh non-repository directory to the explicit exported source path, then
-# prove the complete patch is present before compiling anything.
-patch = ROOT / 'patches/drivers/NativeUfs-sm8350.patch'
-with tempfile.TemporaryDirectory(prefix='unixnu-ufs-patch-') as temporary:
-    command = ['git', 'apply', '--unsafe-paths', '--directory', str(UFS)]
-    subprocess.run(command + [str(patch)], cwd=temporary, check=True)
-    subprocess.run(command + ['--reverse', '--check', str(patch)], cwd=temporary, check=True)
-print('Storage 12377: complete SM8350 source patch verified', flush=True)
+if not FAMILY_ONLY:
+    shutil.copytree(ROOT / 'drivers/NativeUfs', UFS,
+                    ignore=shutil.ignore_patterns('.git', 'build'), dirs_exist_ok=True)
+    # The assembled tree is nested inside the checkout. git apply can otherwise
+    # silently skip paths outside that repository-relative cwd prefix. Apply from
+    # a fresh non-repository directory to the explicit exported source path, then
+    # prove the complete patch is present before compiling anything.
+    patch = ROOT / 'patches/drivers/NativeUfs-sm8350.patch'
+    with tempfile.TemporaryDirectory(prefix='unixnu-ufs-patch-') as temporary:
+        command = ['git', 'apply', '--unsafe-paths', '--directory', str(UFS)]
+        subprocess.run(command + [str(patch)], cwd=temporary, check=True)
+        subprocess.run(command + ['--reverse', '--check', str(patch)], cwd=temporary, check=True)
+    print('Storage 12377: complete SM8350 source patch verified', flush=True)
 OBJ = ROOT / 'build/xnu-12377.121.6/ios-obj/DEVELOPMENT_ARM64_BCM2837'
 record = json.loads((OBJ / 'iokit/DEVELOPMENT/IOPlatformExpert.cpo.json').read_text().strip().rstrip(','))
 
 # DriverKit is a separate user-driver backend requiring generated IIG RPC
 # classes. This build links native kernel block devices. Keep the public
 # reference immutable and retain the complete ordinary block-storage path.
-driver = (SOURCE / 'IOBlockStorageDriver.cpp').read_text()
+compatibility = enabled()
+print(f'Storage 12377: KDK IOKit ABI profile={int(compatibility)}; iOS target retained', flush=True)
+validate_compile_profile(record['arguments'], compatibility)
+headers = json.loads((ROOT / 'build/storage-abi/headers.json').read_text())
+if headers.get('kdk_iokit_abi', False) != compatibility:
+    raise SystemExit('Storage headers and source ABI profiles differ')
+driver = storage_copy('IOBlockStorageDriver.cpp', (SOURCE / 'IOBlockStorageDriver.cpp').read_text(), compatibility)
 old = '#include "IOUserBlockStorageDevice_kext.h"'
 assert driver.count(old) == 1
 driver = driver.replace(old, '#if !IOSTORAGE_NATIVE_ONLY\n' + old + '\n#endif')
@@ -61,12 +80,40 @@ driver = driver.replace(old, '''#if IOSTORAGE_NATIVE_ONLY
     {''')
 patched = OUT / 'IOBlockStorageDriver.cpp'
 patched.write_text(driver)
-sources = [SOURCE / (name + '.cpp') for name in (
+def exported_source(name):
+    source = SOURCE / (name + '.cpp')
+    text = source.read_text()
+    adapted = storage_copy(source.name, text, compatibility)
+    if adapted == text:
+        return source
+    target = OUT / source.name
+    target.write_text(adapted)
+    return target
+
+sources = [exported_source(name) for name in (
     'IOStorage', 'IOBlockStorageDevice', 'IOMedia', 'IOMediaBSDClient',
     'IOPartitionScheme', 'IOGUIDPartitionScheme', 'IOFDiskPartitionScheme',
     'IOApplePartitionScheme', 'IOAppleLabelScheme', 'IOFilterScheme')]
-sources += [patched, UFS / 'NativeUfs.cpp']
+sources.append(patched)
+ram_block = os.environ.get('XNU_NATIVE_RAM_BLOCK', '0')
+if ram_block not in ('0', '1'):
+    raise SystemExit('XNU_NATIVE_RAM_BLOCK must be 0 or 1')
 verified = os.environ.get('XNU_NATIVE_UFS_VERIFIED_ROOT') == '1'
+owner_root = os.environ.get('XNU_NATIVE_UFS_OWNER_ROOT', '0')
+if owner_root not in ('0', '1'):
+    raise SystemExit('XNU_NATIVE_UFS_OWNER_ROOT must be 0 or 1')
+if FAMILY_ONLY:
+    if ram_block == '1' or verified:
+        raise SystemExit('--family-only builds IOStorageFamily alone: the RAM block and verified UFS '
+                         'root belong to the SM8350 UFS path')
+else:
+    if owner_root == '1' and not verified:
+        raise SystemExit('Owner root binding requires the real verified UFS backend')
+    sources.append(UFS / 'NativeUfs.cpp')
+    if ram_block == '1':
+        sources.append(ROOT / 'drivers/NativeRamBlock/NativeRamBlock.cpp')
+    if owner_root == '1':
+        sources.append(ROOT / 'scripts/ufs-owner-root.cpp')
 extra = []
 if verified:
     anchor = ROOT / 'scripts/zeta-owner-root-key.h'
@@ -95,10 +142,11 @@ def compile_one(source, record):
         elif value not in ('-MD', '-MMD', '-MP') and not value.startswith('-W'):
             command.append(value)
         index += 1
-    command += extra + ['-I', str(ROOT / 'build/storage-abi/include'), '-I', str(SOURCE),
-                '-I', str(UFS),
-                '-DNATIVE_UFS_SM8350=1', '-DIOSTORAGE_NATIVE_ONLY=1',
-                '-DNATIVE_UFS_PROGRESS_OBSERVER=0',
+    command += extra + ['-I', str(ROOT / 'build/storage-abi/include'), '-I', str(SOURCE)]
+    if not FAMILY_ONLY:
+        command += ['-I', str(UFS), '-DNATIVE_UFS_SM8350=1', '-DNATIVE_UFS_PROGRESS_OBSERVER=0']
+    command += ['-DIOSTORAGE_NATIVE_ONLY=1',
+                '-fno-stack-check',
                 '-Wall', '-Wextra', '-Wno-unused-parameter', '-Wno-deprecated-declarations',
                 '-Wno-c99-designator', '-Wno-reorder-init-list']
     destination.with_suffix('.command.json').write_text(json.dumps(command, indent=2) + '\n')
@@ -144,13 +192,17 @@ collisions = sorted(defined & kernel)
 missing = sorted(imports - kernel - {'___dso_handle'})
 report = {'source_revision': REVISION, 'objects': len(objects),
           'ordinary_arm64_ios26_audited': True, 'native_kernel_backend_only': True,
-          'sm8350_stream_id': 0xe0, 'kernel_collisions': collisions,
-          'missing_kernel_imports': missing, 'hardware_qualified': False, 'owner_policy_from_ufs': verified, 'progress_observer_compiled': False,
+          'family_only': FAMILY_ONLY, 'objects_built': [p.name for p in objects],
+          'sm8350_stream_id': None if FAMILY_ONLY else 0xe0, 'kernel_collisions': collisions,
+          'missing_kernel_imports': missing, 'hardware_qualified': False, 'owner_policy_from_ufs': verified,
+          'owner_mounted_root_binding': owner_root == '1', 'progress_observer_compiled': False,
+          'native_ram_block': ram_block == '1',
           'native_driver_sha256': hashlib.sha256(patched.read_bytes()).hexdigest()}
 (OUT / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
 if collisions or missing:
     raise SystemExit(f'Storage symbol audit: collisions={collisions}; missing={missing}')
-archive = OUT / 'libStorageUfs.a'
+archive = OUT / ('libStorageFamily.a' if FAMILY_ONLY else 'libStorageUfs.a')
 archive.unlink(missing_ok=True)
 subprocess.run(['xcrun', 'ar', 'rcs', archive, *objects], check=True)
-print('Storage 12377: native IOStorageFamily + SM8350 UFS; no unavailable imports')
+print('Storage 12377: native IOStorageFamily' + ('' if FAMILY_ONLY else ' + SM8350 UFS') +
+      '; no unavailable imports')

@@ -1,0 +1,51 @@
+"""Explicit, opt-in public IOStorage compatibility profile for KDK APFS audits.
+
+This does not change TARGET_OS_OSX, relocate a kext, or establish compatibility.
+References stay immutable; only exported build copies select the public legacy
+implementations associated with the extra virtual slots.
+"""
+import os
+
+
+GUARDS = {
+    'IOStorage.h': 6, 'IOStorage.cpp': 4,
+    'IOBlockStorageDevice.h': 4, 'IOBlockStorageDevice.cpp': 3,
+    'IOBlockStorageDriver.h': 6, 'IOBlockStorageDriver.cpp': 8,
+    'IOMedia.cpp': 5, 'IOPartitionScheme.cpp': 2,
+}
+
+
+def enabled():
+    value = os.environ.get('XNU_KDK_IOKIT_ABI', '0')
+    if value not in ('0', '1'):
+        raise ValueError('XNU_KDK_IOKIT_ABI must be 0 or 1')
+    return value == '1'
+
+
+def validate_compile_profile(arguments, compatibility):
+    """Read both driver spelling and Clang -MJ's split -D spelling."""
+    profiles = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in ('-D', '-U'):
+            index += 1
+            if index >= len(arguments):
+                raise ValueError('Incomplete compiler preprocessor option')
+            argument += arguments[index]
+        if argument.startswith('-DXNU_KDK_IOKIT_ABI='):
+            profiles.append(argument.split('=', 1)[1])
+        elif argument in ('-DXNU_KDK_IOKIT_ABI', '-UXNU_KDK_IOKIT_ABI'):
+            raise ValueError('Storage ABI profile must be explicitly 0 or 1')
+        index += 1
+    if profiles not in ([], ['0'], ['1']) or (profiles == ['1']) != compatibility:
+        raise ValueError('Storage ABI profile differs from recorded kernel compile flags')
+
+
+def storage_copy(name, text, compatibility):
+    if not compatibility or name not in GUARDS:
+        return text
+    old = '#if TARGET_OS_OSX\n'
+    if text.count(old) != GUARDS[name] or 'XNU_KDK_IOKIT_ABI' in text:
+        raise ValueError(f'{name}: public storage compatibility guards changed')
+    return text.replace(old, '#if TARGET_OS_OSX || XNU_KDK_IOKIT_ABI\n')

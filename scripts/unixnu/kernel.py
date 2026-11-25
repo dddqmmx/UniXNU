@@ -86,7 +86,7 @@ def linux_env(ctx):
             'UNIXNU_PLATFORM_PATH': str(fakeroot / 'Platforms/iPhoneOS.platform'),
             'CROSS_CLANG': str(toolchain / 'llvm/bin/clang'), 'DARWIN_TRIPLE': f'arm64-apple-ios{ios_min}',
             'XNU_IOS_MIN': ios_min,
-            'CROSS_EXTRA_FLAGS': '-mllvm -disable-atexit-based-global-dtor-lowering',
+            'CROSS_EXTRA_FLAGS': '-mcpu=cyclone -mllvm -disable-atexit-based-global-dtor-lowering',
             'CCC_OVERRIDE_OPTIONS': '# +-Wno-missing-designated-field-initializers +-Wno-unused-but-set-global'}
     if sdk_build:
         environment['UNIXNU_SDK_BUILD'] = str(sdk_build)

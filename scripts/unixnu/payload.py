@@ -138,6 +138,14 @@ def build(ctx, kernel=None):
         probe = (['--reset-delay', str(int(spec['entry_probe_reset_delay']))]
                  if spec.get('entry_probe_reset_delay') else ['--no-reset'])
         screen = ['--panic-screen'] if spec.get('panic_screen') else []
+        # A board that brings itself back unattended sets how long a panic stays on screen
+        # before the reset (panic_reset in board.toml [payload], seconds).
+        if spec.get('panic_screen') and spec.get('panic_reset'):
+            reset = int(spec['panic_reset'])
+            if not 0 <= reset <= 300:
+                raise Error('payload.panic_reset must be 0..300 seconds')
+            if reset:
+                screen += ['--panic-reset', str(reset)]
         if spec.get('entry_probe_reset_delay') and spec.get('entry_probe_reset_after'):
             # Stage 4 in place of stage 3: reset after the Nth call to SYMBOL in FUNCTION.
             probe += ['--reset-after', spec['entry_probe_reset_after'], '--in', spec.get('entry_probe_reset_in', '_arm_init'),
@@ -147,6 +155,12 @@ def build(ctx, kernel=None):
                 probe.append('--reset-before')
         run(['python3', ctx.tree / 'scripts/patch-xnu-entry-probe.py', payloads / 'kernel.macho', *screen, *probe],
             cwd=ctx.tree, env=dict(os.environ, UNIXNU_UEFI=str(ctx.uefi or '')), log_file=ctx.logs / 'payload-patch.log')
+        seal = ctx.tree / 'scripts/seal-source-crypto-kernel.py'
+        if seal.is_file() and b'_source_corecrypto14_bootstrap\0' in (payloads / 'kernel.macho').read_bytes():
+            seal_args = ['--static-if-defaults'] if b'__static_if' in (payloads / 'kernel.macho').read_bytes() else []
+            run(['python3', seal, *seal_args, payloads / 'kernel.macho'],
+                cwd=ctx.tree, log_file=ctx.logs / 'payload-seal.log')
+            (payloads / 'kernel.macho.crypto-hmac.json').unlink(missing_ok=True)
     if trust:
         shutil.copyfile(trust, payloads / 'kernel.macho.trustcache')
     if addon:

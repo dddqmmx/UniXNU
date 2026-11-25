@@ -1,0 +1,38 @@
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -85,6 +85,34 @@ const char * gIOKernelConfigTables =
+     "     'IOResourceMatch' = IOBSD;"
+     "     'IOProbeScore' = 1000:32;"
+     "   },"
++#endif
++#if XNU_BOARD_STORAGE
++    "   {"
++    "     'IOClass' = BoardStorage;"
++    "     'IOMatchCategory' = BoardStorage;"
++    "     'IOProviderClass' = IOPlatformExpertDevice;"
++    "     'IOProbeScore' = 500:32;"
++    "   },"
++    "   {"
++    "     'IOClass' = IOBlockStorageDriver;"
++    "     'IOProviderClass' = IOBlockStorageDevice;"
++    "     'IOPropertyMatch' = { 'device-type' = Generic; };"
++    "   },"
++    "   {"
++    "     'IOClass' = IOGUIDPartitionScheme;"
++    "     'IOProviderClass' = IOMedia;"
++    "     'IOMatchCategory' = IOStorage;"
++    "     'IOProbeScore' = 4000:32;"
++    "     'Content Mask' = 'GUID_partition_scheme';"
++    "     'IOPropertyMatch' = { Whole = .true.; };"
++    "   },"
++    "   {"
++    "     'IOClass' = IOMediaBSDClient;"
++    "     'IOProviderClass' = IOMedia;"
++    "     'IOMatchCategory' = IOMediaBSDClient;"
++    "     'IOProbeScore' = 30000:32;"
++    "     'IOResourceMatch' = IOBSD;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"

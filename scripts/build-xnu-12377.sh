@@ -95,12 +95,14 @@ fi
 export XNU_AVAILABILITY_PL=$FAKEROOT/usr/local/libexec/availability.pl
 
 python3 scripts/kdk-headers.py --url "$KDK_URL" --sha256 "$KDK_SHA256" --cache .cache/kdk "$KDKROOT"
+rm -rf "$WORK/EXTERNAL_HEADERS/TrustCache"
 
 # A Linux host builds with upstream clang and GNU tools (scripts/linux): rewrite the few sources that
 # assume Apple's, and pass xnu's make what a Mac provides itself (host compiler, mig, memory and CPU
 # counts). The driver's linux_env() provides CLT_PREFIX, DARWIN_TRIPLE, CROSS_CLANG and the shims.
 XNU_HOST_MAKE_ARGS=()
 if [ "$(uname -s)" = Linux ]; then
+  export UNIXNU_SDKROOT=$FAKEROOT
   UNIXNU_FAKEROOT="$FAKEROOT" UNIXNU_XNU_WORK="$WORK_ABS" python3 scripts/linux/prepare-xnu.py source
   export PLATFORM=iPhoneOS HOST_CC="$CLT_PREFIX/bin/xnu-host-cc" MIGCOM="$CLT_PREFIX/libexec/migcom"
   XNU_HOST_MAKE_ARGS=(TIGHTBEAMC=tightbeamc-not-supported BUILD_DSYM=0
@@ -139,9 +141,37 @@ for header in Path('refer/libdispatch/os').glob('*.h'):
         target.write_bytes(result.stdout)
 PY
 
+# C++ ABI changes invalidate every kernel object, not selected methods only.
+# Keep generated SDK headers and provider compile records on the same profile.
+KDK_IOKIT_ABI=${XNU_KDK_IOKIT_ABI:-0}
+if [ "$KDK_IOKIT_ABI" != 0 ] && [ "$KDK_IOKIT_ABI" != 1 ]; then
+  echo 'XNU_KDK_IOKIT_ABI must be 0 or 1' >&2
+  exit 1
+fi
+APFS_CSR=${XNU_APFS_CSR:-0}
+if [ "$APFS_CSR" != 0 ] && [ "$APFS_CSR" != 1 ]; then
+  echo 'XNU_APFS_CSR must be 0 or 1' >&2
+  exit 1
+fi
+mkdir -p "$OUT"
+ABI_PROFILE="iokit-abi-v2:$KDK_IOKIT_ABI:csr=$APFS_CSR"
+if [ "$(cat "$OUT/.iokit-abi-profile" 2>/dev/null || true)" != "$ABI_PROFILE" ]; then
+  rm -rf "$OUT/ios-obj" "$OUT/ios-sym" "$OUT/ios-dst" "$OUT/hdrs-obj" "$OUT/hdrs-sym"
+  rm -f "$FAKEROOT/.xnu-$XNU_VERSION-headers"
+  printf '%s\n' "$ABI_PROFILE" > "$OUT/.iokit-abi-profile"
+fi
+MASTER_CONFIG_DIR=$WORK_ABS/config
+if [ "$APFS_CSR" = 1 ]; then
+  MASTER_CONFIG_DIR=$OUT/apfs-csr-config
+  python3 scripts/prepare-apfs-csr-config.py "$WORK/config" "$MASTER_CONFIG_DIR"
+fi
+if [ "${XNU_NATIVE_UFS_SM8350:-0}" = 1 ] || [ "${XNU_BOARD_STORAGE:-0}" = 1 ] || [ "$KDK_IOKIT_ABI" = 1 ]; then
+  python3 scripts/prepare-storage-headers.py
+fi
+
 if [ ! -f "$FAKEROOT/.xnu-$XNU_VERSION-headers" ]; then
   make -C "$WORK" installhdrs SDKROOT=macosx ARCH_CONFIGS=ARM64 \
-    MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=DEVELOPMENT \
+    MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=DEVELOPMENT MASTERCONFDIR="$MASTER_CONFIG_DIR" \
     RC_DARWIN_KERNEL_VERSION="$XNU_DARWIN" RC_ProjectSourceVersion="$XNU_VERSION" \
     MAKEJOBS=-j"$JOBS" OBJROOT="$OUT/hdrs-obj" SYMROOT="$OUT/hdrs-sym" DSTROOT="$FAKEROOT" \
     ${XNU_HOST_MAKE_ARGS[@]+"${XNU_HOST_MAKE_ARGS[@]}"}
@@ -159,6 +189,7 @@ if [ "$(uname -s)" = Linux ]; then
 fi
 
 EXTRA_CFLAGS=${XNU_EXTRA_CFLAGS:-}
+EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_KDK_IOKIT_ABI=$KDK_IOKIT_ABI"
 EXTRA_MAKE_ARGS=()
 SOURCE_CRYPTO=${XNU_SOURCE_CORECRYPTO14:-0}
 if [ "$SOURCE_CRYPTO" != 0 ] && [ "$SOURCE_CRYPTO" != 1 ]; then
@@ -175,6 +206,16 @@ flag() {
   fi
   echo "$value"
 }
+APFS_CRYPTO_KPIS=$(flag XNU_APFS_CRYPTO_KPIS)
+if [ "$APFS_CRYPTO_KPIS" = 1 ] && [ "$SOURCE_CRYPTO" != 1 ]; then
+  echo 'XNU_APFS_CRYPTO_KPIS requires XNU_SOURCE_CORECRYPTO14=1' >&2
+  exit 1
+fi
+APFS_MLDSA=$(flag XNU_APFS_MLDSA)
+if [ "$APFS_MLDSA" = 1 ] && [ "$APFS_CRYPTO_KPIS" != 1 ]; then
+  echo 'XNU_APFS_MLDSA requires XNU_APFS_CRYPTO_KPIS=1' >&2
+  exit 1
+fi
 # rebuild_on_change NAME VALUE OBJECT...: make does not track per-object flags, so drop the objects when VALUE changes.
 rebuild_on_change() {
   local stamp=$OBJ/.$1 value=$2
@@ -191,8 +232,13 @@ rebuild_on_change() {
 # BCM2837 start.s routes the core timers through the Raspberry Pi local interrupt controller (physical
 # 0x40000040) before the MMU is on; other boards need it off and use ArmCpu's GICv3 provider.
 NATIVE_ARCH_TIMER=$(flag XNU_NATIVE_ARCH_TIMER)
-EXTRA_MAKE_ARGS+=("start.o_SFLAGS_ADD=-DXNU_NATIVE_ARCH_TIMER=$NATIVE_ARCH_TIMER")
+NATIVE_SMP_TRACE=$(flag XNU_NATIVE_SMP_TRACE)
+EXTRA_MAKE_ARGS+=("start.o_SFLAGS_ADD=-DXNU_NATIVE_ARCH_TIMER=$NATIVE_ARCH_TIMER -DXNU_NATIVE_SMP_TRACE=$NATIVE_SMP_TRACE")
+EXTRA_MAKE_ARGS+=("arm_init.o_CFLAGS_ADD=-DXNU_NATIVE_SMP_TRACE=$NATIVE_SMP_TRACE")
+EXTRA_MAKE_ARGS+=("cpu.o_CFLAGS_ADD=-DXNU_NATIVE_SMP_TRACE=$NATIVE_SMP_TRACE")
 rebuild_on_change native-arch-timer-mode "$NATIVE_ARCH_TIMER" osfmk/DEVELOPMENT/start.o
+rebuild_on_change native-smp-trace-mode "$NATIVE_SMP_TRACE" osfmk/DEVELOPMENT/start.o osfmk/DEVELOPMENT/arm_init.o \
+  osfmk/DEVELOPMENT/cpu.o
 # An EL1 port may have access to the virtual timer while physical-timer control traps.
 VIRTUAL_TIMER_ONLY=$(flag XNU_VIRTUAL_TIMER_ONLY)
 EXTRA_MAKE_ARGS+=("machine_routines.o_CFLAGS_ADD=-DXNU_VIRTUAL_TIMER_ONLY=$VIRTUAL_TIMER_ONLY")
@@ -213,10 +259,79 @@ rebuild_on_change dt-panic-region-mode "$DT_PANIC_REGION" pexpert/DEVELOPMENT/pe
 TRUST_CACHE_MODE=$(flag XNU_TRUST_CACHE_RUNTIME)
 EXTRA_MAKE_ARGS+=("startup.o_CFLAGS_ADD=-DXNU_NATIVE_TRUST_CACHE=$TRUST_CACHE_MODE")
 rebuild_on_change trust-cache-mode "$TRUST_CACHE_MODE" osfmk/DEVELOPMENT/startup.o
+# Publish the dyld_flags boot-arg in the comm page before launchd, as customer dyld reads only the comm page.
+DYLD_FLAGS_BOOTARG=$(flag XNU_DYLD_FLAGS_BOOTARG)
+EXTRA_MAKE_ARGS+=("commpage.o_CFLAGS_ADD=-DXNU_DYLD_FLAGS_BOOTARG=$DYLD_FLAGS_BOOTARG")
+rebuild_on_change dyld-flags-bootarg-mode "$DYLD_FLAGS_BOOTARG" osfmk/DEVELOPMENT/commpage.o
+PROC_TRACE_CONSOLE=$(flag XNU_PROC_TRACE_CONSOLE)
+NATIVE_RAM_BLOCK=$(flag XNU_NATIVE_RAM_BLOCK)
+OWNER_DATA_MOUNT=$(flag XNU_OWNER_DATA_MOUNT)
+if [ "$NATIVE_RAM_BLOCK" = 1 ] && [ "$(flag XNU_NATIVE_UFS_SM8350)" != 1 ]; then
+  echo 'NativeRamBlock builds with the native storage family and its store window (XNU_NATIVE_UFS_SM8350)' >&2
+  exit 1
+fi
+if [ "$OWNER_DATA_MOUNT" = 1 ] && [ "$NATIVE_RAM_BLOCK" != 1 ]; then
+  echo 'XNU_OWNER_DATA_MOUNT mounts the NativeRamBlock seed (XNU_NATIVE_RAM_BLOCK)' >&2
+  exit 1
+fi
+EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_NATIVE_RAM_BLOCK=$NATIVE_RAM_BLOCK"
+rebuild_on_change native-ram-block-mode "$NATIVE_RAM_BLOCK" iokit/DEVELOPMENT/KernelConfigTables.cpo
+OWNER_DATA_HEADER=$OUT/owner-data-volume.h
+mkdir -p "$OUT"
+python3 - "$OWNER_DATA_HEADER" "$OWNER_DATA_MOUNT" "${XNU_OWNER_DATA_VOLUME_UUID:-}" <<'PY_DATA_UUID'
+import re
+import sys
+from pathlib import Path
+path, mode, value = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+text = ''
+if mode == '1':
+    if not re.fullmatch(r'[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}', value):
+        raise SystemExit('Set XNU_OWNER_DATA_VOLUME_UUID to the Data seed volume UUID (upper-case)')
+    text = '#define XNU_OWNER_DATA_VOLUME_UUID "' + value + '"\n'
+if not path.exists() or path.read_text() != text:
+    path.write_text(text)
+PY_DATA_UUID
+rebuild_on_change owner-data-mount-mode "$OWNER_DATA_MOUNT:$NATIVE_RAM_BLOCK:${XNU_OWNER_DATA_VOLUME_UUID:-}" bsd/DEVELOPMENT/kern_exec.o
+EXTRA_MAKE_ARGS+=("kern_exec.o_CFLAGS_ADD=-DXNU_PROC_TRACE_CONSOLE=$PROC_TRACE_CONSOLE -DXNU_OWNER_DATA_MOUNT=$OWNER_DATA_MOUNT -DXNU_NATIVE_RAM_BLOCK=$NATIVE_RAM_BLOCK -include $OWNER_DATA_HEADER")
+EXTRA_MAKE_ARGS+=("kern_exit.o_CFLAGS_ADD=-DXNU_PROC_TRACE_CONSOLE=$PROC_TRACE_CONSOLE")
+EXTRA_MAKE_ARGS+=("exception.o_CFLAGS_ADD=-DXNU_PROC_TRACE_CONSOLE=$PROC_TRACE_CONSOLE")
+EXTRA_MAKE_ARGS+=("sys_work_interval.o_CFLAGS_ADD=-DXNU_PROC_TRACE_CONSOLE=$PROC_TRACE_CONSOLE")
+EXTRA_MAKE_ARGS+=("work_interval.o_CFLAGS_ADD=-DXNU_PROC_TRACE_CONSOLE=$PROC_TRACE_CONSOLE")
+rebuild_on_change proc-trace-console-mode "$PROC_TRACE_CONSOLE" bsd/DEVELOPMENT/kern_exec.o bsd/DEVELOPMENT/kern_exit.o \
+  osfmk/DEVELOPMENT/exception.o bsd/DEVELOPMENT/sys_work_interval.o osfmk/DEVELOPMENT/work_interval.o
+EDT_FSTAB=$(flag XNU_EDT_FSTAB)
+EXTRA_MAKE_ARGS+=("vfs_subr.o_CFLAGS_ADD=-DXNU_EDT_FSTAB=$EDT_FSTAB")
+EXTRA_MAKE_ARGS+=("kern_newsysctl.o_CFLAGS_ADD=-DXNU_EDT_FSTAB=$EDT_FSTAB")
+rebuild_on_change edt-fstab-mode "$EDT_FSTAB" bsd/DEVELOPMENT/vfs_subr.o bsd/DEVELOPMENT/kern_newsysctl.o
+BOOT_PROGRESS=$(flag XNU_BOOT_PROGRESS)
+BOOT_PROGRESS_OBJECTS="osfmk/DEVELOPMENT/arm_init.o osfmk/DEVELOPMENT/startup.o osfmk/DEVELOPMENT/video_console.o
+  osfmk/DEVELOPMENT/serial_console.o osfmk/DEVELOPMENT/sleh.o bsd/DEVELOPMENT/bsd_init.o bsd/DEVELOPMENT/kern_exec.o
+  bsd/DEVELOPMENT/kern_exit.o pexpert/DEVELOPMENT/pe_kprintf.o"
+EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_BOOT_PROGRESS=$BOOT_PROGRESS"
+# shellcheck disable=SC2086
+rebuild_on_change boot-progress-mode "$BOOT_PROGRESS" $BOOT_PROGRESS_OBJECTS
+NATIVE_LEGACY_DISPLAY=$(flag XNU_NATIVE_LEGACY_DISPLAY)
+EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_NATIVE_LEGACY_DISPLAY=$NATIVE_LEGACY_DISPLAY"
+rebuild_on_change native-legacy-display-mode "$NATIVE_LEGACY_DISPLAY" bsd/DEVELOPMENT/bsd_init.o
+# A board's own block storage: the device repository's scripts/build-board-storage-12377.py compiles the
+# public IOStorageFamily and the board's block driver into build/board-storage-12377/libBoardStorage.a.
+# native-board-storage.patch matches the IOService class BoardStorage that archive defines on the platform
+# expert device, and the storage family classes on what it publishes. The SM8350 UFS path links its own
+# IOStorageFamily, so the two are exclusive.
+BOARD_STORAGE=$(flag XNU_BOARD_STORAGE)
+if [ "$BOARD_STORAGE" = 1 ] && [ "$(flag XNU_NATIVE_UFS_SM8350)" = 1 ]; then
+  echo 'XNU_BOARD_STORAGE and XNU_NATIVE_UFS_SM8350 both link IOStorageFamily; select one' >&2
+  exit 1
+fi
+EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_BOARD_STORAGE=$BOARD_STORAGE"
+rebuild_on_change board-storage-mode "$BOARD_STORAGE" iokit/DEVELOPMENT/KernelConfigTables.cpo
+IOS_CLASS_ALIASES=$(flag XNU_NATIVE_IOS_CLASS_ALIASES)
+EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_NATIVE_IOS_CLASS_ALIASES=$IOS_CLASS_ALIASES"
+rebuild_on_change ios-class-aliases-mode "$IOS_CLASS_ALIASES" iokit/DEVELOPMENT/IOUserClient.cpo
 if [ "$SOURCE_CRYPTO" = 1 ]; then
   EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_SOURCE_CORECRYPTO14=1"
 fi
-rebuild_on_change source-crypto-mode "$SOURCE_CRYPTO" osfmk/DEVELOPMENT/prng_random.o pexpert/DEVELOPMENT/pe_init.o
+rebuild_on_change source-crypto-mode "$SOURCE_CRYPTO:$APFS_CRYPTO_KPIS:$APFS_MLDSA" osfmk/DEVELOPMENT/prng_random.o pexpert/DEVELOPMENT/pe_init.o
 ARM_DT_PLATFORM=$(flag XNU_ARM_DT_PLATFORM)
 ARMCPU=$(flag XNU_ARMCPU)
 if [ "$ARMCPU" = 1 ] && { [ "$ARM_DT_PLATFORM" != 1 ] || [ "$NATIVE_ARCH_TIMER" != 1 ]; }; then
@@ -228,6 +343,20 @@ rebuild_on_change platform-personalities "$ARM_DT_PLATFORM:$ARMCPU" iokit/DEVELO
 NATIVE_DWC3_CONSOLE=$(flag XNU_NATIVE_DWC3_CONSOLE)
 SOURCE_PTHREAD=$(flag XNU_SOURCE_PTHREAD)
 NATIVE_UFS_SM8350=$(flag XNU_NATIVE_UFS_SM8350)
+UFS_OWNER_ROOT=$(flag XNU_NATIVE_UFS_OWNER_ROOT)
+UFS_VERIFIED_ROOT=$(flag XNU_NATIVE_UFS_VERIFIED_ROOT)
+if [ "$UFS_OWNER_ROOT" = 1 ]; then
+  if [ "$SOURCE_CRYPTO" != 1 ]; then
+    echo 'Owner root binding requires source crypto' >&2
+    exit 1
+  fi
+  if [ "$BOARD_STORAGE" != 1 ] && { [ "$NATIVE_UFS_SM8350" != 1 ] || [ "$UFS_VERIFIED_ROOT" != 1 ]; }; then
+    echo 'Owner root binding requires BOARD_STORAGE or verified SM8350 UFS' >&2
+    exit 1
+  fi
+fi
+EXTRA_MAKE_ARGS+=("bsd_init.o_CFLAGS_ADD=-DXNU_NATIVE_UFS_OWNER_ROOT=$UFS_OWNER_ROOT")
+rebuild_on_change ufs-owner-root-mode "$UFS_OWNER_ROOT" bsd/DEVELOPMENT/bsd_init.o
 EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_NATIVE_UFS_SM8350=$NATIVE_UFS_SM8350"
 EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_NATIVE_DWC3_CONSOLE=$NATIVE_DWC3_CONSOLE"
 rebuild_on_change native-dwc3-console "$NATIVE_DWC3_CONSOLE" pexpert/DEVELOPMENT/pe_serial.o osfmk/DEVELOPMENT/rtclock.o
@@ -248,9 +377,10 @@ fi
 build_kernel() {
 make ${MAKE_KEEP_GOING[@]+"${MAKE_KEEP_GOING[@]}"} -C "$WORK" "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iphoneos}" KDKROOT="$KDKROOT" \
   ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=BCM2837 KERNEL_CONFIGS=DEVELOPMENT \
+  MASTERCONFDIR="$MASTER_CONFIG_DIR" \
   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY \
   ARM64_LINK_ADDR=0xfffffff007004000 ARM64_PLKSEG_ADDR=0xfffffff004004000 \
-  DEPLOYMENT_TARGET_FLAGS="-miphoneos-version-min=$IOS_MIN -DXNU_TARGET_OS_IOS" \
+  DEPLOYMENT_TARGET_FLAGS="-miphoneos-version-min=$IOS_MIN -mcpu=cyclone -DXNU_TARGET_OS_IOS" \
   DEPLOYMENT_LINKER_FLAGS="-Wl,-ios_version_min,$IOS_MIN" \
   RC_DARWIN_KERNEL_VERSION="$XNU_DARWIN" RC_ProjectSourceVersion="$XNU_VERSION" \
   BUILD_LTO=0 BOUND_CHECKS=0 BUILD_WERROR="${XNU_BUILD_WERROR:-0}" MAKEJOBS=-j"$JOBS" \
@@ -258,20 +388,41 @@ make ${MAKE_KEEP_GOING[@]+"${MAKE_KEEP_GOING[@]}"} -C "$WORK" "${XNU_BUILD_TARGE
   OBJROOT="$OUT/ios-obj" SYMROOT="$OUT/ios-sym" DSTROOT="$OUT/ios-dst"
 }
 
-if [ "$SOURCE_CRYPTO" = 1 ] || [ "$ARM_DT_PLATFORM" = 1 ] || [ "$ARMCPU" = 1 ] || [ "$NATIVE_DWC3_CONSOLE" = 1 ] || [ "$SOURCE_PTHREAD" = 1 ] || [ "$NATIVE_UFS_SM8350" = 1 ]; then
+if [ "$SOURCE_CRYPTO" = 1 ] || [ "$ARM_DT_PLATFORM" = 1 ] || [ "$ARMCPU" = 1 ] || [ "$NATIVE_DWC3_CONSOLE" = 1 ] || [ "$SOURCE_PTHREAD" = 1 ] || [ "$NATIVE_UFS_SM8350" = 1 ] || [ "$BOOT_PROGRESS" = 1 ] || \
+   [ "$NATIVE_LEGACY_DISPLAY" = 1 ] || [ "$BOARD_STORAGE" = 1 ]; then
   # First produce the unlinked objects/filelist for collision discovery.
   # Bootstrap references are enabled only after the provider archive exists.
   rm -f "$OBJ/osfmk/DEVELOPMENT/prng_random.o" "$OBJ/pexpert/DEVELOPMENT/pe_init.o"
   rm -f "$OBJ/pexpert/DEVELOPMENT/pe_serial.o" "$OBJ/osfmk/DEVELOPMENT/rtclock.o"
-  build_kernel CFLAGS_EXTRA="$EXTRA_CFLAGS -UXNU_SOURCE_CORECRYPTO14 -UXNU_ARM_DT_PLATFORM -UXNU_ARMCPU -UXNU_NATIVE_DWC3_CONSOLE"
+  build_kernel CFLAGS_EXTRA="$EXTRA_CFLAGS -UXNU_SOURCE_CORECRYPTO14 -UXNU_ARM_DT_PLATFORM -UXNU_ARMCPU -UXNU_NATIVE_DWC3_CONSOLE -UXNU_BOOT_PROGRESS -UXNU_NATIVE_LEGACY_DISPLAY -UXNU_BOARD_STORAGE" \
+    "bsd_init.o_CFLAGS_ADD=-DXNU_NATIVE_UFS_OWNER_ROOT=0" \
+    "kern_exec.o_CFLAGS_ADD=-DXNU_PROC_TRACE_CONSOLE=$PROC_TRACE_CONSOLE -DXNU_OWNER_DATA_MOUNT=0 -DXNU_NATIVE_RAM_BLOCK=$NATIVE_RAM_BLOCK -include $OWNER_DATA_HEADER"
   ARCHIVE_FLAGS="-L$FAKEROOT/usr/local/lib/kernel -lfirehose_kernel"
   ARCHIVE_DEPENDENCIES=""
   if [ "$SOURCE_CRYPTO" = 1 ]; then
-    python3 scripts/build-corecrypto-14.py --xnu-12377
-    python3 scripts/build-corecrypto-14.py --xnu-12377 --namespace
+    CRYPTO_STAMP="$ROOT/build/corecrypto-12377/.profile"
+    CRYPTO_WANT="$SOURCE_CRYPTO:$APFS_CRYPTO_KPIS:$APFS_MLDSA"
+    if [ "$APFS_MLDSA" = 1 ] && [ ! -f "$ROOT/build/apfs-mldsa-12377/libapfs_mldsa_namespaced.a" ]; then
+      python3 scripts/build-apfs-mldsa-12377.py
+    fi
+    if [ ! -f "$ROOT/build/corecrypto-12377/libcorecrypto_kernel_noasm-namespaced.a" ] || \
+       [ "$(cat "$CRYPTO_STAMP" 2>/dev/null || true)" != "$CRYPTO_WANT" ]; then
+      python3 scripts/build-corecrypto-14.py --xnu-12377
+      python3 scripts/build-corecrypto-14.py --xnu-12377 --namespace
+      printf '%s\n' "$CRYPTO_WANT" > "$CRYPTO_STAMP"
+    fi
     CRYPTO_ARCHIVE=$ROOT/build/corecrypto-12377/libcorecrypto_kernel_noasm-namespaced.a
     ARCHIVE_FLAGS="$ARCHIVE_FLAGS $CRYPTO_ARCHIVE"
     ARCHIVE_DEPENDENCIES="$CRYPTO_ARCHIVE"
+    if [ "$APFS_CRYPTO_KPIS" = 1 ]; then
+      ARCHIVE_FLAGS="$ARCHIVE_FLAGS -Wl,-u,_ccdigest_parallel,-u,_ccsha3_256_di,-u,_ccsha3_384_di,-u,_ccsha3_512_di"
+      ARCHIVE_FLAGS="$ARCHIVE_FLAGS -Wl,-u,_ccec_import_pub,-u,_ccrsa_import_pub,-u,_ccrsa_verify_pkcs1v15_allowshortsigs"
+    fi
+    if [ "$APFS_MLDSA" = 1 ]; then
+      MLDSA_ARCHIVE=$ROOT/build/apfs-mldsa-12377/libapfs_mldsa_namespaced.a
+      ARCHIVE_FLAGS="$ARCHIVE_FLAGS -Wl,-u,_ccmldsa87,-u,_ccmldsa_import_pubkey,-u,_ccmldsa_verify $MLDSA_ARCHIVE"
+      ARCHIVE_DEPENDENCIES="$ARCHIVE_DEPENDENCIES $MLDSA_ARCHIVE"
+    fi
   fi
   for component in ArmDTPlatform ArmCpu NativeDwc3Console; do
     if { [ "$component" = ArmDTPlatform ] && [ "$ARM_DT_PLATFORM" = 1 ]; } || \
@@ -292,6 +443,36 @@ if [ "$SOURCE_CRYPTO" = 1 ] || [ "$ARM_DT_PLATFORM" = 1 ] || [ "$ARMCPU" = 1 ] |
     ARCHIVE_FLAGS="$ARCHIVE_FLAGS -Wl,-force_load,$archive"
     ARCHIVE_DEPENDENCIES="$ARCHIVE_DEPENDENCIES $archive"
   fi
+  if [ "$BOOT_PROGRESS" = 1 ]; then
+    if [ ! -f scripts/build-boot-progress.py ]; then
+      echo 'XNU_BOOT_PROGRESS needs scripts/build-boot-progress.py from the device repository' >&2
+      exit 1
+    fi
+    python3 scripts/build-boot-progress.py
+    archive=$ROOT/build/boot-progress/libBootProgress.a
+    ARCHIVE_FLAGS="$ARCHIVE_FLAGS -Wl,-force_load,$archive"
+    ARCHIVE_DEPENDENCIES="$ARCHIVE_DEPENDENCIES $archive"
+  fi
+  if [ "$NATIVE_LEGACY_DISPLAY" = 1 ]; then
+    if [ ! -f scripts/build-native-legacy-display.py ]; then
+      echo 'XNU_NATIVE_LEGACY_DISPLAY needs scripts/build-native-legacy-display.py from the device repository' >&2
+      exit 1
+    fi
+    python3 scripts/build-native-legacy-display.py
+    archive=$ROOT/build/native-legacy-display/libNativeLegacyDisplay.a
+    ARCHIVE_FLAGS="$ARCHIVE_FLAGS -Wl,-force_load,$archive"
+    ARCHIVE_DEPENDENCIES="$ARCHIVE_DEPENDENCIES $archive"
+  fi
+  if [ "$BOARD_STORAGE" = 1 ]; then
+    if [ ! -f scripts/build-board-storage-12377.py ]; then
+      echo 'XNU_BOARD_STORAGE needs scripts/build-board-storage-12377.py from the device repository' >&2
+      exit 1
+    fi
+    python3 scripts/build-board-storage-12377.py
+    archive=$ROOT/build/board-storage-12377/libBoardStorage.a
+    ARCHIVE_FLAGS="$ARCHIVE_FLAGS -Wl,-force_load,$archive"
+    ARCHIVE_DEPENDENCIES="$ARCHIVE_DEPENDENCIES $archive"
+  fi
   if [ "$NATIVE_UFS_SM8350" = 1 ]; then
     python3 scripts/build-storage-12377.py
     archive=$ROOT/build/storage-12377/libStorageUfs.a
@@ -301,7 +482,51 @@ if [ "$SOURCE_CRYPTO" = 1 ] || [ "$ARM_DT_PLATFORM" = 1 ] || [ "$ARMCPU" = 1 ] |
   rm -f "$OBJ/osfmk/DEVELOPMENT/prng_random.o" "$OBJ/pexpert/DEVELOPMENT/pe_init.o"
   rm -f "$OBJ/iokit/DEVELOPMENT/KernelConfigTables.cpo"
   rm -f "$OBJ/pexpert/DEVELOPMENT/pe_serial.o" "$OBJ/osfmk/DEVELOPMENT/rtclock.o"
+  if [ "$UFS_OWNER_ROOT" = 1 ]; then
+    rm -f "$OBJ/bsd/DEVELOPMENT/bsd_init.o"
+  fi
+  if [ "$NATIVE_LEGACY_DISPLAY" = 1 ]; then
+    rm -f "$OBJ/bsd/DEVELOPMENT/bsd_init.o"
+  fi
+  if [ "$OWNER_DATA_MOUNT" = 1 ]; then
+    rm -f "$OBJ/bsd/DEVELOPMENT/kern_exec.o"
+  fi
+  if [ "$BOOT_PROGRESS" = 1 ]; then
+    for object in $BOOT_PROGRESS_OBJECTS; do
+      rm -f "$OBJ/$object"
+    done
+  fi
   build_kernel "LD_KERNEL_ARCHIVES=$ARCHIVE_FLAGS" "XNU_EXTERNAL_KERNEL_ARCHIVES=$ARCHIVE_DEPENDENCIES"
+  if [ "$APFS_CRYPTO_KPIS" = 1 ]; then
+    python3 - "$OBJ/mach.development.bcm2837.unstripped.noctf" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+kernel = Path(sys.argv[1])
+defined = set(subprocess.check_output(['xcrun', 'nm', '-g', '-U', '-j', kernel], text=True).splitlines())
+required = {'_ccdigest_parallel', '_ccsha3_256_di', '_ccsha3_384_di',
+            '_ccsha3_512_di', '_native_apfs_crypto_kpis_selftest',
+            '_native_apfs_crypto_selftest_result', '_ccec_import_pub',
+            '_ccrsa_import_pub', '_ccrsa_verify_pkcs1v15_allowshortsigs'}
+if os.environ.get('XNU_APFS_MLDSA') == '1':
+    required |= {'_ccmldsa87', '_ccmldsa_import_pubkey', '_ccmldsa_verify',
+                 '_zeta_mldsa26_native_apfs_mldsa_selftest',
+                 '_zeta_mldsa26_native_apfs_mldsa_selftest_result'}
+if os.environ.get('XNU_APFS_CSR') == '1':
+    required.add('_csr_check')
+if os.environ.get('XNU_NATIVE_UFS_OWNER_ROOT') == '1':
+    required |= {'_native_ufs_owner_root_authorized', '_native_ufs_owner_root_accepted'}
+missing = sorted(required - defined)
+kernel.with_suffix('.apfs-crypto.json').write_text(json.dumps({
+    'required_definitions': sorted(required), 'missing': missing,
+    'runtime_selftest_passed': False}, indent=2) + '\n')
+if missing:
+    raise SystemExit(f'Final kernel omitted APFS crypto definitions: {missing}')
+PY
+  fi
   if [ "$SOURCE_CRYPTO" = 1 ]; then
     python3 scripts/seal-source-crypto-kernel.py --static-if-defaults "$OBJ/mach.development.bcm2837.unstripped.noctf"
   fi

@@ -161,6 +161,7 @@ Types are `s` for string, `x` for hex cells, `i` for decimal cells, `u` for unsi
 | `title` | string | Menu title |
 | `dram_size` | string | DRAM size for the ADT |
 | `panic_screen` | boolean | Patch the panic screen into the payload kernel |
+| `panic_reset` | integer (s) | Keep a panic on screen this long, then reset into fastboot (0 = stay). Boards whose bootloader reads its reboot reason from the PMIC need the board's mark routine; the panic screen calls it before the reset |
 | `trust_cache_sha256` | array | Accepted trust cache hashes. An owner bundle passed with `--owner-trust-cache` skips this list |
 | `kernel_args` | array | Default kernel arguments |
 | `tools` | boolean | Add Tools to the generated menu; configure plugins with [log capture](/porting/log-capture#firmware-setup) |

@@ -336,7 +336,13 @@ def generate(dtb, config, *, unique_chip_id=None, data=False, trust=False, addon
     mappings = [('PackedRAMDisk' if options.get('packed_data_ramdisk') else 'RAMDisk', bytes(16))] if data else []
     mappings += [('TrustCache', bytes(16))] if trust else []
     mappings += [('GpuAddon', bytes(16))] if addon else []
-    children = [node('chosen', chosen, [node('memory-map', mappings), node('manifest-properties')])]
+    chosen_children = [node('memory-map', mappings), node('manifest-properties')]
+    if options.get('csr_config') is not None:
+        csr = int(str(options['csr_config']), 0)
+        if not 0 <= csr < 1 << 32:
+            raise Error('payload.adt.csr_config must fit 32 bits')
+        chosen_children.append(node('asmb', [('lp-sip0', struct.pack('<Q', csr)), ('lp-sip1', struct.pack('<I', 0))]))
+    children = [node('chosen', chosen, chosen_children)]
     cpus = next((entry for entry in root.children if entry.name == 'cpus'), None)
     if cpus is None:
         raise Error('Hardware DTS requires /cpus')
