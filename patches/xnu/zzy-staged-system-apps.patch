@@ -2,10 +2,10 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index 4704203..2c6f346 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7508,6 +7508,313 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+@@ -7508,6 +7508,341 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
  	    "7570.iPadOS_17_Flat_Background-1024w-1366h@2x~ipad.ca/J120.png", &native_gpu_addon3_stage, &native_gpu_addon3_status);
  }
- 
+
 +/* The deletable system apps (Weather, Notes, Calendar, ...) ship in the OS volume's /private/var/staged_system_apps. A restore copies
 + * them into the Data volume, where SystemAppMigrator installs them during the first-boot data migration; until then only the
 + * placeholders in /System/Library/AppPlaceholders exist and the widgets of those apps stay blank. The owner Data mount hides the OS
@@ -16,6 +16,7 @@ index 4704203..2c6f346 100644
 + * Counters for the boot log: stage (1 copying, 2 copied, 3 copied before, -1 no
 + * source, -2 out of memory), directories, files, MiB, failures and the last error. */
 +#include <sys/dirent.h>
++extern void sirius_apfs_try_resize_data(const char *stage) __attribute__((weak_import));
 +volatile int native_staged_apps_stage = 0;
 +volatile int native_staged_apps_dirs = 0;
 +volatile int native_staged_apps_files = 0;
@@ -23,6 +24,8 @@ index 4704203..2c6f346 100644
 +volatile int native_staged_apps_failed = 0;
 +volatile int native_staged_apps_error = 0;
 +static uint64_t native_staged_apps_bytes;
++static uint64_t native_staged_apps_unsynced_bytes;
++static uint32_t native_staged_apps_unsynced_files;
 +char native_staged_apps_path[96];   /* the file being copied, for the boot log */
 +static const char native_staged_apps_marker[] = "/private/var/db/.sheng-staged-apps";
 +#define NATIVE_STAGED_APPS_OWNER 501
@@ -70,7 +73,8 @@ index 4704203..2c6f346 100644
 +	strlcpy(native_staged_apps_path, path + (length > sizeof(native_staged_apps_path) - 1 ? length - (sizeof(native_staged_apps_path) - 1) : 0),
 +	    sizeof(native_staged_apps_path));
 +	error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
-+	for (off_t at = 0; !error;) {
++	off_t at = 0;
++	for (; !error;) {
 +		int resid = 0;
 +		error = vn_rdwr(UIO_READ, source, (caddr_t)buffer, (int)chunk, at, UIO_SYSSPACE, IO_NOAUTH, vfs_context_ucred(ctx), &resid,
 +		    vfs_context_proc(ctx));
@@ -85,6 +89,7 @@ index 4704203..2c6f346 100644
 +		}
 +		at += length;
 +		native_staged_apps_bytes += (uint64_t)length;
++		native_staged_apps_unsynced_bytes += (uint64_t)length;
 +	}
 +	if (vp) {
 +		if (!error) {
@@ -95,9 +100,12 @@ index 4704203..2c6f346 100644
 +			VATTR_SET(&va, va_gid, NATIVE_STAGED_APPS_OWNER);
 +			error = vnode_setattr(vp, &va, ctx);
 +		}
-+		/* Each file goes to the medium before the next: without it the copy piled up dirty pages until it stalled (int-220). */
-+		if (!error) {
++		/* Sync large files or every 4 MiB / 64 files so dirty pages never pile up (int-220) while avoiding 4214 separate eMMC flushes. */
++		native_staged_apps_unsynced_files++;
++		if (!error && (at >= 262144 || native_staged_apps_unsynced_bytes >= (4 * 1024 * 1024) || native_staged_apps_unsynced_files >= 64)) {
 +			error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++			native_staged_apps_unsynced_bytes = 0;
++			native_staged_apps_unsynced_files = 0;
 +		}
 +		int close_error = vnode_close(vp, FWRITE, ctx);
 +		if (!error) {
@@ -187,6 +195,10 @@ index 4704203..2c6f346 100644
 +					if (!child_error) {
 +						native_staged_apps_files++;
 +						native_staged_apps_mib = (int)(native_staged_apps_bytes >> 20);
++						if ((native_staged_apps_files % 500) == 0) {
++							printf("sirius staged_apps: files=%d dirs=%d mib=%d fail=%d\n",
++							    native_staged_apps_files, native_staged_apps_dirs, native_staged_apps_mib, native_staged_apps_failed);
++						}
 +					}
 +				} else {
 +					child_error = ENOTSUP;
@@ -261,7 +273,11 @@ index 4704203..2c6f346 100644
 +	if (!vnode_lookup(native_staged_apps_marker, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) {
 +		vnode_put(vp);
 +		native_staged_apps_stage = 3;
++		printf("sirius staged_apps: already staged (stage=3)\n");
 +		return;
++	}
++	if (&sirius_apfs_try_resize_data) {
++		sirius_apfs_try_resize_data("pre-staged-apps");
 +	}
 +	int error = covered ? vnode_getwithref(covered) : ENOENT;
 +	if (!error) {
@@ -275,6 +291,7 @@ index 4704203..2c6f346 100644
 +	if (error) {
 +		native_staged_apps_error = error;
 +		native_staged_apps_stage = -1;
++		printf("sirius staged_apps: no source dir err=%d\n", error);
 +		return;
 +	}
 +	const uint32_t chunk = 1024 * 1024;
@@ -282,6 +299,7 @@ index 4704203..2c6f346 100644
 +	char *path = kalloc_data(MAXPATHLEN, Z_WAITOK);
 +	if (buffer && path) {
 +		native_staged_apps_stage = 1;
++		printf("sirius staged_apps: starting copy into /private/var/staged_system_apps\n");
 +		strlcpy(path, "/private/var/staged_system_apps", MAXPATHLEN);
 +		error = native_staged_apps_mkdir(p, scratch, path);
 +		if (error) {
@@ -293,14 +311,23 @@ index 4704203..2c6f346 100644
 +			vnode_t marker = NULLVP;
 +			error = vnode_open(native_staged_apps_marker, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, 0644, 0, &marker, ctx);
 +			if (!error) {
-+				error = vnode_close(marker, FWRITE, ctx);
++				error = VNOP_FSYNC(marker, MNT_WAIT, ctx);
++				int close_err = vnode_close(marker, FWRITE, ctx);
++				if (!error) {
++					error = close_err;
++				}
 +			}
 +			if (error) {
 +				native_staged_apps_fail(error);
 +			} else {
 +				native_staged_apps_stage = 2;
++				native_gestalt_cache_drop(p, scratch);
++				native_ls_store_drop(p, scratch);
 +			}
 +		}
++		printf("sirius staged_apps: done stage=%d dirs=%d files=%d mib=%d fail=%d err=%d\n",
++		    native_staged_apps_stage, native_staged_apps_dirs, native_staged_apps_files,
++		    native_staged_apps_mib, native_staged_apps_failed, native_staged_apps_error);
 +	} else {
 +		native_staged_apps_stage = -2;
 +	}
